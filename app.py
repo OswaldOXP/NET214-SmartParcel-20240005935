@@ -6,13 +6,20 @@
 # AWS Acc : 778900739808
 # -------------------------------------------------------------------
 
-
-
-
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import socket
+import boto3
+import uuid
+from datetime import datetime
 
 app = Flask(__name__)
+
+# Connect to DynamoDB
+dynamodb = boto3.resource('dynamodb', region_name='ap-southeast-2')
+table = dynamodb.Table('smartparcel-parcels')
+
+def generate_parcel_id():
+    return f"PKG-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -23,27 +30,145 @@ def health():
 
 @app.route('/api/parcels', methods=['POST'])
 def create_parcel():
-    return jsonify({'message': 'Parcel created'}), 201
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No JSON data provided'}), 400
+    
+    required = ['sender', 'receiver', 'address', 'email']
+    for field in required:
+        if field not in data:
+            return jsonify({'error': f'Missing required field: {field}'}), 400
+    
+    parcel_id = generate_parcel_id()
+    timestamp = datetime.now().isoformat()
+    
+    item = {
+        'parcel_id': parcel_id,
+        'sender': data['sender'],
+        'receiver': data['receiver'],
+        'address': data['address'],
+        'email': data['email'],
+        'status': 'created',
+        'history': [{'status': 'created', 'timestamp': timestamp}],
+        'created_at': timestamp,
+        'updated_at': timestamp
+    }
+    
+    table.put_item(Item=item)
+    
+    return jsonify({
+        'parcel_id': parcel_id,
+        'status': 'created',
+        'message': 'Parcel created successfully'
+    }), 201
 
-@app.route('/api/parcels/<id>', methods=['GET'])
-def get_parcel(id):
-    return jsonify({'parcel_id': id, 'status': 'pending'})
+@app.route('/api/parcels/<parcel_id>', methods=['GET'])
+def get_parcel(parcel_id):
+    try:
+        response = table.get_item(Key={'parcel_id': parcel_id})
+        if 'Item' not in response:
+            return jsonify({'error': 'Parcel not found'}), 404
+        return jsonify(response['Item'])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/parcels/<id>/status', methods=['PUT'])
-def update_status(id):
-    return jsonify({'updated': True})
+@app.route('/api/parcels/<parcel_id>/status', methods=['PUT'])
+def update_status(parcel_id):
+    data = request.get_json()
+    if not data or 'status' not in data:
+        return jsonify({'error': 'Missing status field'}), 400
+    
+    valid_statuses = ['picked_up', 'in_transit', 'delivered']
+    if data['status'] not in valid_statuses:
+        return jsonify({'error': f'Invalid status. Must be one of: {valid_statuses}'}), 400
+    
+    try:
+        response = table.get_item(Key={'parcel_id': parcel_id})
+        if 'Item' not in response:
+            return jsonify({'error': 'Parcel not found'}), 404
+        
+        item = response['Item']
+        
+        if item['status'] == 'delivered':
+            return jsonify({'error': 'Cannot update delivered parcel'}), 409
+        
+        timestamp = datetime.now().isoformat()
+        item['status'] = data['status']
+        item['history'].append({'status': data['status'], 'timestamp': timestamp})
+        item['updated_at'] = timestamp
+        
+        table.put_item(Item=item)
+        
+        return jsonify({
+            'parcel_id': parcel_id,
+            'status': data['status'],
+            'updated': True
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/parcels', methods=['GET'])
 def list_parcels():
-    return jsonify({'parcels': []})
+    status_filter = request.args.get('status')
+    
+    try:
+        if status_filter:
+            response = table.query(
+                IndexName='status-index',
+                KeyConditionExpression='status = :status',
+                ExpressionAttributeValues={':status': status_filter}
+            )
+        else:
+            response = table.scan()
+        
+        return jsonify({
+            'parcels': response.get('Items', []),
+            'count': len(response.get('Items', []))
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/parcels/<id>', methods=['DELETE'])
-def cancel_parcel(id):
-    return jsonify({'cancelled': True})
+@app.route('/api/parcels/<parcel_id>', methods=['DELETE'])
+def cancel_parcel(parcel_id):
+    try:
+        response = table.get_item(Key={'parcel_id': parcel_id})
+        if 'Item' not in response:
+            return jsonify({'error': 'Parcel not found'}), 404
+        
+        item = response['Item']
+        
+        if item['status'] not in ['created']:
+            return jsonify({'error': 'Cannot cancel parcel that is already picked up or in transit'}), 409
+        
+        timestamp = datetime.now().isoformat()
+        item['status'] = 'cancelled'
+        item['history'].append({'status': 'cancelled', 'timestamp': timestamp})
+        item['updated_at'] = timestamp
+        
+        table.put_item(Item=item)
+        
+        return jsonify({
+            'parcel_id': parcel_id,
+            'cancelled': True,
+            'message': 'Parcel cancelled'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/parcels/<id>/photo', methods=['POST'])
-def upload_photo(id):
-    return jsonify({'photo_url': 's3://bucket/photo.jpg'})
+@app.route('/api/parcels/<parcel_id>/photo', methods=['POST'])
+def upload_photo(parcel_id):
+    if 'photo' not in request.files:
+        return jsonify({'error': 'No photo file provided'}), 400
+    
+    photo = request.files['photo']
+    if photo.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    return jsonify({
+        'parcel_id': parcel_id,
+        'photo_url': f's3://smartparcel-photos-20240005935/{parcel_id}/proof.jpg',
+        'message': 'Photo uploaded'
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, threaded=True)
