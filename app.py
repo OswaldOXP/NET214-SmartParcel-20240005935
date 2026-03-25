@@ -12,6 +12,8 @@ import boto3
 import uuid
 from datetime import datetime
 
+app = Flask(__name__)
+
 # API Keys with roles
 API_KEYS = {
     "key-driver-001": {"role": "driver", "name": "Driver 1"},
@@ -35,11 +37,13 @@ def check_auth(required_role=None):
     
     return user, None, None
 
-app = Flask(__name__)
-
 # Connect to DynamoDB
 dynamodb = boto3.resource('dynamodb', region_name='ap-southeast-2')
 table = dynamodb.Table('smartparcel-parcels')
+
+# S3 client
+s3 = boto3.client('s3', region_name='ap-southeast-2')
+S3_BUCKET = 'smartparcel-photos-20240005935'
 
 def generate_parcel_id():
     return f"PKG-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
@@ -59,15 +63,15 @@ def create_parcel():
     data = request.get_json()
     if not data:
         return jsonify({'error': 'No JSON data provided'}), 400
-    
+
     required = ['sender', 'receiver', 'address', 'email']
     for field in required:
         if field not in data:
             return jsonify({'error': f'Missing required field: {field}'}), 400
-    
+
     parcel_id = generate_parcel_id()
     timestamp = datetime.now().isoformat()
-    
+
     item = {
         'parcel_id': parcel_id,
         'sender': data['sender'],
@@ -79,9 +83,9 @@ def create_parcel():
         'created_at': timestamp,
         'updated_at': timestamp
     }
-    
+
     table.put_item(Item=item)
-    
+
     return jsonify({
         'parcel_id': parcel_id,
         'status': 'created',
@@ -109,28 +113,28 @@ def update_status(parcel_id):
     data = request.get_json()
     if not data or 'status' not in data:
         return jsonify({'error': 'Missing status field'}), 400
-    
+
     valid_statuses = ['picked_up', 'in_transit', 'delivered']
     if data['status'] not in valid_statuses:
         return jsonify({'error': f'Invalid status. Must be one of: {valid_statuses}'}), 400
-    
+
     try:
         response = table.get_item(Key={'parcel_id': parcel_id})
         if 'Item' not in response:
             return jsonify({'error': 'Parcel not found'}), 404
-        
+
         item = response['Item']
-        
+
         if item['status'] == 'delivered':
             return jsonify({'error': 'Cannot update delivered parcel'}), 409
-        
+
         timestamp = datetime.now().isoformat()
         item['status'] = data['status']
         item['history'].append({'status': data['status'], 'timestamp': timestamp})
         item['updated_at'] = timestamp
-        
+
         table.put_item(Item=item)
-        
+
         return jsonify({
             'parcel_id': parcel_id,
             'status': data['status'],
@@ -145,7 +149,7 @@ def list_parcels():
     if error_response:
         return error_response, status
     status_filter = request.args.get('status')
-    
+
     try:
         if status_filter:
             response = table.query(
@@ -155,7 +159,7 @@ def list_parcels():
             )
         else:
             response = table.scan()
-        
+
         return jsonify({
             'parcels': response.get('Items', []),
             'count': len(response.get('Items', []))
@@ -172,19 +176,19 @@ def cancel_parcel(parcel_id):
         response = table.get_item(Key={'parcel_id': parcel_id})
         if 'Item' not in response:
             return jsonify({'error': 'Parcel not found'}), 404
-        
+
         item = response['Item']
-        
+
         if item['status'] not in ['created']:
             return jsonify({'error': 'Cannot cancel parcel that is already picked up or in transit'}), 409
-        
+
         timestamp = datetime.now().isoformat()
         item['status'] = 'cancelled'
         item['history'].append({'status': 'cancelled', 'timestamp': timestamp})
         item['updated_at'] = timestamp
-        
+
         table.put_item(Item=item)
-        
+
         return jsonify({
             'parcel_id': parcel_id,
             'cancelled': True,
@@ -198,6 +202,7 @@ def upload_photo(parcel_id):
     user, error_response, status = check_auth(required_role='driver')
     if error_response:
         return error_response, status
+    
     if 'photo' not in request.files:
         return jsonify({'error': 'No photo file provided'}), 400
     
@@ -205,11 +210,42 @@ def upload_photo(parcel_id):
     if photo.filename == '':
         return jsonify({'error': 'No file selected'}), 400
     
-    return jsonify({
-        'parcel_id': parcel_id,
-        'photo_url': f's3://smartparcel-photos-20240005935/{parcel_id}/proof.jpg',
-        'message': 'Photo uploaded'
-    })
+    try:
+        # Create S3 key
+        s3_key = f"{parcel_id}/{photo.filename}"
+        
+        # Upload to S3 with encryption
+        s3.upload_fileobj(
+            photo,
+            S3_BUCKET,
+            s3_key,
+            ExtraArgs={'ServerSideEncryption': 'AES256'}
+        )
+        
+        # Generate public URL
+        photo_url = f"https://{S3_BUCKET}.s3.ap-southeast-2.amazonaws.com/{s3_key}"
+        
+        # Update parcel in DynamoDB with photo URL
+        response = table.get_item(Key={'parcel_id': parcel_id})
+        if 'Item' in response:
+            item = response['Item']
+            if 'photos' not in item:
+                item['photos'] = []
+            item['photos'].append({
+                'url': photo_url,
+                'filename': photo.filename,
+                'uploaded_at': datetime.now().isoformat()
+            })
+            table.put_item(Item=item)
+        
+        return jsonify({
+            'parcel_id': parcel_id,
+            'photo_url': photo_url,
+            'message': 'Photo uploaded successfully'
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, threaded=True)
