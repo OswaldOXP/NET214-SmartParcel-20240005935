@@ -12,6 +12,29 @@ import boto3
 import uuid
 from datetime import datetime
 
+# API Keys with roles
+API_KEYS = {
+    "key-driver-001": {"role": "driver", "name": "Driver 1"},
+    "key-admin-001": {"role": "admin", "name": "Admin"},
+    "key-customer-001": {"role": "customer", "name": "Customer"}
+}
+
+def check_auth(required_role=None):
+    """Check API key and role"""
+    api_key = request.headers.get('X-API-Key')
+    if not api_key:
+        return None, jsonify({'error': 'API key required'}), 401
+    
+    if api_key not in API_KEYS:
+        return None, jsonify({'error': 'Invalid API key'}), 401
+    
+    user = API_KEYS[api_key]
+    
+    if required_role and user['role'] != required_role:
+        return None, jsonify({'error': f'Access denied. {required_role} role required'}), 403
+    
+    return user, None, None
+
 app = Flask(__name__)
 
 # Connect to DynamoDB
@@ -30,6 +53,9 @@ def health():
 
 @app.route('/api/parcels', methods=['POST'])
 def create_parcel():
+    user, error_response, status = check_auth(required_role='driver')
+    if error_response:
+        return error_response, status
     data = request.get_json()
     if not data:
         return jsonify({'error': 'No JSON data provided'}), 400
@@ -64,6 +90,9 @@ def create_parcel():
 
 @app.route('/api/parcels/<parcel_id>', methods=['GET'])
 def get_parcel(parcel_id):
+    user, error_response, status = check_auth()
+    if error_response:
+        return error_response, status
     try:
         response = table.get_item(Key={'parcel_id': parcel_id})
         if 'Item' not in response:
@@ -74,6 +103,9 @@ def get_parcel(parcel_id):
 
 @app.route('/api/parcels/<parcel_id>/status', methods=['PUT'])
 def update_status(parcel_id):
+    user, error_response, status = check_auth(required_role='driver')
+    if error_response:
+        return error_response, status
     data = request.get_json()
     if not data or 'status' not in data:
         return jsonify({'error': 'Missing status field'}), 400
@@ -109,6 +141,9 @@ def update_status(parcel_id):
 
 @app.route('/api/parcels', methods=['GET'])
 def list_parcels():
+    user, error_response, status = check_auth(required_role='admin')
+    if error_response:
+        return error_response, status
     status_filter = request.args.get('status')
     
     try:
@@ -130,6 +165,9 @@ def list_parcels():
 
 @app.route('/api/parcels/<parcel_id>', methods=['DELETE'])
 def cancel_parcel(parcel_id):
+    user, error_response, status = check_auth(required_role='admin')
+    if error_response:
+        return error_response, status
     try:
         response = table.get_item(Key={'parcel_id': parcel_id})
         if 'Item' not in response:
@@ -157,6 +195,9 @@ def cancel_parcel(parcel_id):
 
 @app.route('/api/parcels/<parcel_id>/photo', methods=['POST'])
 def upload_photo(parcel_id):
+    user, error_response, status = check_auth(required_role='driver')
+    if error_response:
+        return error_response, status
     if 'photo' not in request.files:
         return jsonify({'error': 'No photo file provided'}), 400
     
