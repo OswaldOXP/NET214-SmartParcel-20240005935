@@ -10,6 +10,7 @@ from flask import Flask, jsonify, request
 import socket
 import boto3
 import uuid
+import json
 from datetime import datetime
 
 app = Flask(__name__)
@@ -44,6 +45,10 @@ table = dynamodb.Table('smartparcel-parcels')
 # S3 client
 s3 = boto3.client('s3', region_name='ap-southeast-2')
 S3_BUCKET = 'smartparcel-photos-20240005935'
+
+# SQS client
+sqs = boto3.client('sqs', region_name='ap-southeast-2')
+SQS_QUEUE_URL = 'https://sqs.ap-southeast-2.amazonaws.com/778900739808/smartparcel-notifications-20240005935'
 
 def generate_parcel_id():
     return f"PKG-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
@@ -134,6 +139,29 @@ def update_status(parcel_id):
         item['updated_at'] = timestamp
 
         table.put_item(Item=item)
+        
+        # Write to debug file
+        with open('/tmp/sqs_debug.log', 'a') as f:
+            f.write(f"UPDATE: {parcel_id} -> {data['status']} at {timestamp}\n")
+        
+        # Send notification to SQS
+        try:
+            response = sqs.send_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MessageBody=json.dumps({
+                    'parcel_id': parcel_id,
+                    'new_status': data['status'],
+                    'customer_email': item['email'],
+                    'driver_name': user['name'],
+                    'timestamp': timestamp
+                })
+            )
+            with open('/tmp/sqs_debug.log', 'a') as f:
+                f.write(f"SQS SENT: MessageId={response.get('MessageId')}\n")
+        except Exception as e:
+            with open('/tmp/sqs_debug.log', 'a') as f:
+                f.write(f"SQS ERROR: {e}\n")
+
 
         return jsonify({
             'parcel_id': parcel_id,
@@ -142,7 +170,6 @@ def update_status(parcel_id):
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
 @app.route('/api/parcels', methods=['GET'])
 def list_parcels():
     user, error_response, status = check_auth(required_role='admin')
